@@ -1,4 +1,5 @@
 import os
+import numpy as np
 
 
 class tcpi_ipaddr(object):
@@ -57,17 +58,18 @@ class tcpi_bbr_sample(object):
 
         for word in words:
             if word.startswith("bw"):
-                self.bw = word.split(":")[1][:-3]
+                self.bbr_bw = word.split(":")[1][:-3]
             if word.startswith("mrtt"):
-                self.min_rtt = word.split(":")[1]
+                self.bbr_min_rtt = word.split(":")[1]
             if word.startswith("pacing_gain"):
-                self.pacing_gain = word.split(":")[1]
+                self.bbr_pacing_gain = word.split(":")[1]
             if word.startswith("cwnd_gain"):
-                self.cwnd_gain = word.split(":")[1]
+                self.bbr_cwnd_gain = word.split(":")[1]
 
     def __str__(self):
         return "%s %s %s %s" % (
-            self.bw, self.min_rtt, self.pacing_gain, self.cwnd_gain
+            self.bbr_bw, self.bbr_min_rtt, self.bbr_pacing_gain,
+            self.bbr_cwnd_gain
         )
 
 
@@ -84,7 +86,19 @@ class tcpi_sample(object):
     # Default list for printing
     DEFAULT_ATTR_LIST = ["time", "cong", "cwnd", "srtt"]
 
+    attr_type = {
+        "time": float,
+        "cwnd": int,
+        "srtt": float,
+        "lbbr_bw_bps": float,
+        "lbbr_mrtt_ms": float,
+        "lbbr_ssthresh": int,
+        "lbbr_target_cwnd": int,
+    }
+
     def __init__(self, line, attr_list=None):
+        self.base_init()
+
         words = line.split()
         for word in words:
             self.en_tc = True if "tc" == word else False
@@ -98,9 +112,9 @@ class tcpi_sample(object):
             if word.startswith("time:"):
                 self.time = float(word.split(":")[1])
 
-            if "cong" in word:
+            if word.startswith("cong:"):
                 self.cong = word.split(":")[1]
-            if "wscale" in word:
+            if word.startswith("wscale:"):
                 self.snd_wscale, self.rcv_wscale \
                     = [int(w) for w in word.split(":")[1].split(",")]
             if "rto" in word:
@@ -123,7 +137,7 @@ class tcpi_sample(object):
                 self.advmss = int(word.split(":")[1])
             if "cwnd" == word[:4]:
                 self.cwnd = int(word.split(":")[1])
-            if "ssthresh" in word:
+            if word.startswith("ssthresh:"):
                 self.ssthresh = int(word.split(":")[1])
 
             if "bytes_acked" in word:
@@ -142,8 +156,11 @@ class tcpi_sample(object):
             if "dctcp:" in word:
                 self.dctcp = tcpi_dctcp_sample(word.split(":")[1])
 
-            if "bbr:" in word:
+            if word.startswith("bbr:"):
                 self.bbr = tcpi_bbr_sample(word.split(":")[1])
+
+            if word.startswith("lbbr:"):
+                self.get_lbbr_info(word.split(":", 1)[1])
 
             if "send" in word:
                 send_bps = word.split(":")[1][:-3]
@@ -204,61 +221,119 @@ class tcpi_sample(object):
             self.set_attr_list(self.DEFAULT_ATTR_LIST)
         return " ".join(str(attr) for attr in self.get_attrs())
 
+    def base_init(self):
+        self.state = ""
+        self.rcvq = 0
+        self.sndq = 0
+
+    def get_send_rate(self, line):
+        if line[-1] == "K":
+            return float(line[:-1]) * 1000
+        elif line[-1] == "M":
+            return float(line[:-1]) * 1000000
+        else:
+            return float(line)
+
+    def get_lbbr_info(self, line):
+        words = line[1:-1].split(",")
+
+        for word in words:
+            if word.startswith("bw"):
+                self.lbbr_bw_bps = self.get_lbbr_info(word.split(":")[1][:-3])
+            if word.startswith("mrtt"):
+                self.lbbr_mrtt_ms = float(word.split(":")[1])
+            if word.startswith("ssthresh"):
+                self.lbbr_ssthresh = int(word.split(":")[1])
+            if word.startswith("target_cwnd"):
+                self.lbbr_target_cwnd = int(word.split(":")[1])
+
     def set_attr_list(self, attr_list):
-        new_attr_list = []
+        self.attr_list = attr_list
 
-        if not attr_list:
-            attr_list = self.DEFAULT_ATTR_LIST
+    def get_attrs(self, attr_list):
+        return tuple([getattr(self, attr, -1)
+                      for attr in attr_list])
 
-        for attr in attr_list:
-            if attr not in dir(self):
-                print("Do not have %s attribute" % attr)
-            else:
-                new_attr_list.append(attr)
-
-        self.attr_list = new_attr_list
-
-    def get_attrs(self, attr_list=None):
-        if attr_list:
-            self.set_attr_list(attr_list)
-
-        return tuple([getattr(self, attr, -1) for attr in self.attr_list])
+    @classmethod
+    def get_types(cls, attr_list):
+        return np.dtype([(attr, cls.attr_type[attr])
+                         for attr in attr_list])
 
 
-def retrieve_sample_from_file(fin, save=False, attr_list=None):
-    connections = {}
+class tcpi_connection(object):
+    def __init__(self):
+        self.flow_id = ""
+        self.samples = []
+        self.attr_list = []
 
-    if not os.path.isfile(fin):
-        raise FileNotFoundError
+    def add_sample(self, base, detail):
+        if self.flow_id == "":
+            self.flow_id = base.conn_id
 
-    if not attr_list:
-        attr_list = tcpi_sample.DEFAULT_ATTR_LIST
+        if self.flow_id != base.conn_id:
+            print("Incorrect flow-id: <%s> not equals to <%s>" % (
+                self.flow_id, base.conn_id
+            ))
+            raise
 
-    with open(fin) as f:
-        for idx, line in enumerate(f):
-            if idx % 2 == 0:
-                base = tcpi_stat(line)
-                continue
-            detail = tcpi_sample(line, attr_list)
+        detail.state = base.state
+        detail.rcvq = base.rcvq
+        detail.sndq = base.sndq
 
-            conn_id = base.conn_id
-            if conn_id not in connections.keys():
-                connections[conn_id] = []
-            conn = connections[conn_id]
-            conn.append(detail.get_attrs())
+        self.samples.append(detail)
 
-    if not save:
-        return connections
+    def get_attrs(self, attr_list):
+        dt = tcpi_sample.get_types(attr_list)
 
-    for conn_id, conn in connections.items():
-        filename = "(%s)%s.%s" % (",".join(attr_list), fin, conn_id)
-        with open(filename, "w") as f:
-            f.write("\n".join([" ".join(sample) for sample in conn]))
+        return np.array([s.get_attrs(attr_list)
+                         for s in self.samples],
+                        dtype=dt)
 
-    return connections
+
+class tcpi_conn_set(object):
+    def __init__(self, filename=None):
+        self.conns = {}
+        self.attr_list = []
+
+        if filename:
+            self.build_conns_by_file(filename)
+
+    def add_sample(self, base, detail):
+        flow_id = base.conn_id
+
+        if flow_id not in self.conns.keys():
+            self.conns[flow_id] = tcpi_connection()
+        self.conns[flow_id].add_sample(base, detail)
+
+    def build_conns_by_file(self, filename):
+        if not os.path.isfile(filename):
+            raise FileNotFoundError
+
+        with open(filename) as f:
+            for idx, line in enumerate(f):
+                if idx % 2 == 0:
+                    base = tcpi_stat(line)
+                    continue
+                detail = tcpi_sample(line)
+                self.add_sample(base, detail)
+
+    def get_attrs(self, attr_list):
+        ret = {}
+
+        for id, conn in self.conns.items():
+            ret[id] = conn.get_attrs(attr_list)
+
+        return ret
+
+
+def retrieve_data_from_file(fin, attr_list):
+    connections = tcpi_conn_set(fin)
+    ret = connections.get_attrs(attr_list)
+
+    return ret
 
 
 if __name__ == '__main__':
     filename = "output"
 
-    conns = retrieve_sample_from_file(filename, True, ["time", "cwnd"])
+    conns = retrieve_data_from_file(filename, True, ["time", "cwnd"])

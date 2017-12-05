@@ -4,7 +4,11 @@ import matplotlib.pyplot as plt
 import tcpinfo as tcpi
 
 
-def draw_attr(filename, attr, save=None):
+def draw_attr():
+    pass
+
+
+def draw(filename, attr, save=None):
     attr_list = ["time", attr]
     connections = tcpi.retrieve_sample_from_file(filename, save, attr_list)
     dt = np.dtype([("time", float), (attr, int)])
@@ -17,4 +21,4 @@ def draw_attr(filename, attr, save=None):
 
 
 if __name__ == '__main__':
-    draw_attr("output", "cwnd")
+    draw("output", "cwnd")
